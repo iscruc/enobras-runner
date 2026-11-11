@@ -1,0 +1,80 @@
+# Scheduled jobs for enobras.app (D38). The code is in a private repository; this public one only holds the schedule.
+# Builds and publishes only when the data changed (or on a manual deploy run).
+# Public log: one "ok"/"failed" line per step. Full logs stay private (state/logs/ in the private repo, only on failure).
+# Settings needed: secret PRIVATE_REPO_TOKEN (fine-grained token, contents read and write on the private repo only),
+# variable PRIVATE_REPO (owner/name), and the site's variables and secrets listed in the private repo's docs/launch.md.
+name: Run
+on:
+  # schedule: [{ cron: "15 4 * * *" }]                   # OFF until go-live step C5 is tested. Every day 05:15 / 06:15 Madrid.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "sync = update the data and publish; deploy = publish the current code and data only"
+        type: choice
+        options: [sync, deploy]
+        default: deploy
+concurrency: { group: run, cancel-in-progress: false }
+permissions: { contents: read }
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      TZ: Europe/Madrid
+      MODE: ${{ github.event_name == 'schedule' && 'sync' || inputs.mode }}
+      SITE_URL: ${{ vars.SITE_URL }}
+      ALERTS_URL: ${{ vars.ALERTS_URL }}
+      ALERTS_API_URL: ${{ vars.ALERTS_URL }}
+      REPORT_API_URL: ${{ vars.REPORT_API_URL }}
+      PAID_REPORT_ENABLED: ${{ vars.PAID_REPORT_ENABLED }}
+      CLAIM_LISTING_ENABLED: ${{ vars.CLAIM_LISTING_ENABLED }}
+      PRO_WAITLIST_ENABLED: ${{ vars.PRO_WAITLIST_ENABLED }}
+      ANALYTICS_PROVIDER: ${{ vars.ANALYTICS_PROVIDER }}
+      ANALYTICS_WEBSITE_ID: ${{ vars.ANALYTICS_WEBSITE_ID }}
+      ANALYTICS_SRC: ${{ vars.ANALYTICS_SRC }}
+      CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "${{ vars.PRIVATE_REPO }}", token: "${{ secrets.PRIVATE_REPO_TOKEN }}", ref: main }
+      - uses: ./.github/actions/setup
+      - name: Public tenders
+        if: env.MODE == 'sync'
+        run: scripts/ci/quiet.sh placsp python -m pipeline.cli review-queue || true     # a failure keeps the last snapshot
+      - name: Update every source
+        if: env.MODE == 'sync'
+        run: scripts/ci/quiet.sh sources python -m pipeline.cli weekly
+      - name: Save the data state in the private repo
+        if: env.MODE == 'sync'
+        run: |
+          git config user.name "enobras-bot" && git config user.email "actions@users.noreply.github.com"
+          git add state
+          if git diff --cached --quiet; then echo "CHANGED=no" >> "$GITHUB_ENV"; echo "ok: no change today, nothing to publish"; exit 0; fi
+          git commit -q -m "data: daily sync $(date +%F)" && git pull -q --rebase origin main && git push -q
+          echo "CHANGED=yes" >> "$GITHUB_ENV"; echo "ok: state saved"
+      - name: Rebuild data from the saved state
+        if: env.MODE == 'deploy'
+        run: scripts/ci/quiet.sh data python -m pipeline.cli build
+      - name: Tests
+        if: env.CHANGED != 'no'
+        run: |
+          scripts/ci/quiet.sh python-tests python -m pytest -q pipeline/tests
+          scripts/ci/quiet.sh site-tests npm --prefix site exec vitest run
+      - name: Build the site (fails on any local address or pending owner detail)
+        if: env.CHANGED != 'no'
+        env: { PRODUCTION: "1" }
+        run: scripts/ci/quiet.sh build npm --prefix site run build
+      - name: Check every internal link
+        if: env.CHANGED != 'no'
+        run: scripts/ci/quiet.sh links npm --prefix site run check:links dist
+      - name: Publish to Cloudflare Pages
+        if: env.CHANGED != 'no' && (env.CF_TOKEN != '')
+        env: { CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}", CLOUDFLARE_ACCOUNT_ID: "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" }
+        run: scripts/ci/quiet.sh publish npx --yes wrangler@3 pages deploy site/dist --project-name="${{ vars.CF_PAGES_PROJECT || 'enobras' }}" --branch=main
+      - name: Send alert e-mails
+        if: env.CHANGED != 'no' && (env.MODE == 'sync' && env.ALERTS_URL != '')
+        env: { ALERTS_CRON_SECRET: "${{ secrets.ALERTS_CRON_SECRET }}" }
+        run: |
+          curl -fsS -o /dev/null -X POST -H "Authorization: Bearer ${ALERTS_CRON_SECRET}" "${ALERTS_URL}/api/internal/run-digests" && echo "ok: alerts"
+      - name: Keep the full log private
+        if: failure()
+        run: scripts/ci/save-log.sh
