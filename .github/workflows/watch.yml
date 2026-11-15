@@ -3,12 +3,13 @@
 # - the site lists an item that needs a person past its limit ("attention" in status.json);
 # - an access token is expired or expires within 21 days.
 # It also keeps this repository active: GitHub turns off schedules in public repositories after 60 days without activity.
+# It never re-enables workflows itself: GitHub sends the failure e-mails of a schedule to whoever last enabled it.
 name: Watch
 on:
   schedule: [{ cron: "30 10 * * *" }]                     # every day 11:30 / 12:30 Madrid, well after the run
   workflow_dispatch:
 concurrency: { group: watch, cancel-in-progress: true }
-permissions: { contents: write, actions: write }
+permissions: { contents: write }
 jobs:
   watch:
     runs-on: ubuntu-latest
@@ -52,13 +53,16 @@ jobs:
           fi
           [ "$fail" -eq 0 ] && echo "ok: tokens"
           exit "$fail"
-      - name: Keep the schedules on
+      - name: Keep the schedules on (a commit here when the last one is over 25 days old)
         if: always()
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
-          for w in run.yml watch.yml; do gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$w/enable" >/dev/null || true; done
-          if [ "$(date +%d)" = "01" ]; then
+          last="$(gh api "repos/$GITHUB_REPOSITORY/commits?per_page=1" --jq '.[0].commit.committer.date')"
+          age=$(( ($(date +%s) - $(date -d "$last" +%s)) / 86400 ))
+          if [ "$age" -gt 25 ]; then
             sha="$(gh api "repos/$GITHUB_REPOSITORY/contents/heartbeat.txt" --jq .sha 2>/dev/null || true)"
             gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/heartbeat.txt" -f message="heartbeat $(date +%F)" \
               -f content="$(date +%F | base64)" ${sha:+-f sha=$sha} >/dev/null && echo "ok: heartbeat"
+          else
+            echo "ok: last commit $age days ago"
           fi
