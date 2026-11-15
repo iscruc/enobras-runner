@@ -7,7 +7,7 @@
 # variable PRIVATE_REPO (owner/name), and the site's variables and secrets listed in the private repo's docs/launch.md.
 name: Run
 on:
-  schedule: [{ cron: "15 4 * * *" }]                     # every day 05:15 / 06:15 Madrid (on since 2026-11-15, D59)
+  schedule: [{ cron: "15 4 * * 0" }]                     # Sundays 05:15 / 06:15 Madrid (weekly since 2026-11-15, D59)
   workflow_dispatch:
     inputs:
       mode:

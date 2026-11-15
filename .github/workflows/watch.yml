@@ -1,4 +1,4 @@
-# Daily check that enobras.app keeps itself up to date (D59). It fails, and GitHub e-mails the owner, when:
+# Weekly check (Sundays, after the run) that enobras.app keeps itself up to date (D59). It fails, and GitHub e-mails the owner, when:
 # - the site was not updated in the last 36 hours (the daily run failed or stopped);
 # - the site lists an item that needs a person past its limit ("attention" in status.json);
 # - an access token is expired or expires within 21 days.
@@ -6,7 +6,7 @@
 # It never re-enables workflows itself: GitHub sends the failure e-mails of a schedule to whoever last enabled it.
 name: Watch
 on:
-  schedule: [{ cron: "30 10 * * *" }]                     # every day 11:30 / 12:30 Madrid, well after the run
+  schedule: [{ cron: "30 10 * * 0" }]                     # Sundays 11:30 / 12:30 Madrid, six hours after the weekly run
   workflow_dispatch:
 concurrency: { group: watch, cancel-in-progress: true }
 permissions: { contents: write }
