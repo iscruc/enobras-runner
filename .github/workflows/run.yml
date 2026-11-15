@@ -59,7 +59,7 @@ jobs:
       - name: Tests
         run: |
           scripts/ci/quiet.sh python-tests python -m pytest -q pipeline/tests
-          scripts/ci/quiet.sh site-tests npm --prefix site exec vitest run
+          scripts/ci/quiet.sh site-tests npm --prefix site run test        # from site/, so its vitest config applies (D59)
       - name: Build the site (fails on any local address or pending owner detail)
         env: { PRODUCTION: "1" }
         run: |
