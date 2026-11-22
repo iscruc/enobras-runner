@@ -1,6 +1,6 @@
 # Scheduled jobs for enobras.app (D38). The code is in a private repository; this public one only holds the schedule.
 # Every sync run tests, builds and publishes (D59): a run that failed after saving the data, or a code change, is never
-# left unpublished. The watch job (watch.yml) checks every day that this one really happened.
+# left unpublished. The data steps loop over every live city (python -m pipeline.cities live): see the "Every city" step. The watch job (watch.yml) checks every day that this one really happened.
 # Public log: one "ok"/"failed" line per step. Full logs stay private (state/logs/ in the private repo, only on failure).
 # Settings needed: secret PRIVATE_REPO_KEY (deploy key with write access on the private repo, never expires) or
 # PRIVATE_REPO_TOKEN (fine-grained token, contents read and write on the private repo only),
@@ -39,23 +39,38 @@ jobs:
       - uses: actions/checkout@v4
         with: { repository: "${{ vars.PRIVATE_REPO }}", token: "${{ secrets.PRIVATE_REPO_TOKEN || github.token }}", ssh-key: "${{ secrets.PRIVATE_REPO_KEY }}", ref: main }
       - uses: ./.github/actions/setup
-      - name: Public tenders
-        if: env.MODE == 'sync'
-        run: scripts/ci/quiet.sh placsp python -m pipeline.cli review-queue || true     # a failure keeps the last snapshot
-      - name: Update every source
-        if: env.MODE == 'sync'
-        run: scripts/ci/quiet.sh sources python -m pipeline.cli weekly
-      - name: Save the data state in the private repo
-        if: env.MODE == 'sync'
+      # One pass per live city (spec 4.8). Never "set -e": a failed city is recorded, rebuilt from its saved state, and the loop goes on.
+      # Public log: one "ok:/failed:" line per step (quiet.sh) and one "city <slug>: ..." line per city. No secret is ever echoed.
+      - name: Every city (tenders, sources, saved state)
+        id: loop
         run: |
           git config user.name "enobras-bot" && git config user.email "actions@users.noreply.github.com"
-          git add state
-          if git diff --cached --quiet; then echo "ok: no change in the data today"; exit 0; fi
-          git commit -q -m "data: daily sync $(date +%F)" && git pull -q --rebase origin main && git push -q
-          echo "ok: state saved"
-      - name: Rebuild data from the saved state
-        if: env.MODE == 'deploy'
-        run: scripts/ci/quiet.sh data python -m pipeline.cli build
+          failed=""
+          state_dir() { python -c 'import os,sys;from pipeline.cities import load_city;print(os.path.relpath(load_city(sys.argv[1])["dirs"]["state"]))' "$1"; }
+          pipe() { CITY="$1" scripts/ci/quiet.sh "$2" python -m pipeline.cli "$3"; }
+          save_state() {                       # commit one city's state folder and push it (no change: nothing to do)
+            git add "$1"
+            if git diff --cached --quiet; then echo "ok: no change for $2"; return 0; fi
+            git commit -q -m "data: $2 sync $(date +%F)" && git pull -q --rebase --autostash origin main && git push -q && echo "ok: state saved ($2)"
+          }
+          sync_city() {
+            # SHARED PLACSP STEP: when the national feed is crawled once per run into cache/shared/placsp/ with one shared cursor
+            # (pipeline/sources/placsp.py, lead's code), that single crawl goes before the loop and this per-city line is replaced
+            # by a classification from the saved pages. Until then every city asks for it itself; a failure keeps the last snapshot.
+            pipe "$1" "placsp-$1" review-queue || true
+            pipe "$1" "sources-$1" weekly && save_state "$2" "$1"
+          }
+          do_city() {
+            local c="$1" sd res=0; sd="$(state_dir "$c")" || { echo "city $c: failed (no state folder)"; failed="$failed $c"; return; }
+            if [ "$MODE" = sync ]; then sync_city "$c" "$sd" || res=1; else pipe "$c" "data-$c" build || res=1; fi
+            if [ "$res" -eq 0 ]; then echo "city $c: ok"; return; fi
+            git checkout -q -- "$sd" 2>/dev/null; git clean -fdq -- "$sd"     # back to the last saved state
+            if pipe "$c" "rebuild-$c" build; then echo "city $c: failed, rebuilt from its saved state"; else echo "city $c: failed, rebuild failed too"; fi
+            failed="$failed $c"
+          }
+          cities="$(python -m pipeline.cities live)" && [ -n "$cities" ] || { echo "::error::no live cities listed"; exit 1; }
+          for c in $cities; do do_city "$c"; done
+          echo "failed=${failed# }" >> "$GITHUB_OUTPUT"
       - name: Tests
         run: |
           scripts/ci/quiet.sh python-tests python -m pytest -q pipeline/tests
@@ -76,6 +91,12 @@ jobs:
         env: { ALERTS_CRON_SECRET: "${{ secrets.ALERTS_CRON_SECRET }}" }
         run: |
           curl -fsS -o /dev/null -X POST -H "Authorization: Bearer ${ALERTS_CRON_SECRET}" "${ALERTS_URL}/api/internal/run-digests" && echo "ok: alerts"
+      - name: The run ends red when a city failed (the failure e-mail goes out after the site was published)
+        if: always() && steps.loop.outputs.failed != ''
+        env: { FAILED_CITIES: "${{ steps.loop.outputs.failed }}" }
+        run: |
+          echo "::error::failed cities: ${FAILED_CITIES}. They were published from their last saved state."
+          exit 1
       - name: Keep the full log private
         if: failure()
         run: scripts/ci/save-log.sh

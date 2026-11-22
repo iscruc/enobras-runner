@@ -1,6 +1,7 @@
 # Weekly check (Sundays, after the run) that enobras.app keeps itself up to date (D59). It fails, and GitHub e-mails the owner, when:
-# - the site was not updated in the last 36 hours (the daily run failed or stopped);
-# - the site lists an item that needs a person past its limit ("attention" in status.json);
+# - a live city's data was not updated in the last 36 hours (the weekly run failed or stopped);
+# - a live city lists an item that needs a person past its limit ("attention" in status.json);
+# - /cities.json is missing or lists no live city, or a live city's status.json cannot be read;
 # - an access token is expired or expires within 21 days.
 # It also keeps this repository active: GitHub turns off schedules in public repositories after 60 days without activity.
 # It never re-enables workflows itself: GitHub sends the failure e-mails of a schedule to whoever last enabled it.
@@ -15,24 +16,41 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      STATUS_URL: ${{ vars.SITE_URL }}/${{ vars.CITY_PATH || 'malaga' }}/data/status.json
+      SITE: ${{ vars.SITE_URL }}
     steps:
-      - name: The site updated itself and nothing waits for a person
+      - name: Every live city updated itself and nothing waits for a person
         run: |
-          curl -fsS --retry 3 "$STATUS_URL" -o status.json || { echo "::error::status.json could not be read at $STATUS_URL"; exit 1; }
+          curl -fsS --retry 3 "$SITE/cities.json" -o cities.json || { echo "::error::cities.json could not be read at $SITE/cities.json"; exit 1; }
           python3 - <<'EOF'
+          import json, sys
+          d = json.load(open("cities.json"))
+          rows = d if isinstance(d, list) else d.get("cities", [])
+          live = [c["slug"] for c in rows if c.get("status") == "live"]
+          if not live:
+              print("::error::cities.json lists no live city"); sys.exit(1)
+          open("live.txt", "w").write("\n".join(live) + "\n")
+          EOF
+          bad=0
+          for slug in $(cat live.txt); do
+            if ! curl -fsS --retry 3 "$SITE/$slug/data/status.json" -o "status-$slug.json"; then
+              echo "::error::[$slug] status.json could not be read at $SITE/$slug/data/status.json"; bad=1; continue
+            fi
+            python3 - "$slug" <<'EOF' || bad=1
           import datetime as dt, json, sys
-          d = json.load(open("status.json"))
+          slug = sys.argv[1]
+          d = json.load(open(f"status-{slug}.json"))
           age = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(d["generated"])).total_seconds() / 3600
-          bad = [f"the site was last updated {age:.0f} hours ago (limit 36): see the Run workflow"] if age > 36 else []
-          bad += [f"needs a person since {i['since']}: {i['text']}" for i in d.get("attention", []) if i.get("overdue")]
+          bad = [f"[{slug}] the site was last updated {age:.0f} hours ago (limit 36): see the Run workflow"] if age > 36 else []
+          bad += [f"[{slug}] needs a person since {i['since']}: {i['text']}" for i in d.get("attention", []) if i.get("overdue")]
           for i in d.get("attention", []):
               if not i.get("overdue"):
-                  print(f"open, within its limit: {i['text']} (since {i['since']}, limit {i['limit_days']} days)")
+                  print(f"[{slug}] open, within its limit: {i['text']} (since {i['since']}, limit {i['limit_days']} days)")
           [print(f"::error::{b}") for b in bad]
-          print("ok: up to date, nothing overdue" if not bad else f"failed: {len(bad)} problem(s)")
+          print(f"ok: {slug} up to date, nothing overdue" if not bad else f"failed: {slug}, {len(bad)} problem(s)")
           sys.exit(1 if bad else 0)
           EOF
+          done
+          exit "$bad"
       - name: Access tokens still valid
         if: always()
         env: { GH_PAT: "${{ secrets.PRIVATE_REPO_TOKEN }}", CF: "${{ secrets.CLOUDFLARE_API_TOKEN }}" }
